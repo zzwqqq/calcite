@@ -17,7 +17,6 @@
 package org.apache.calcite.rel.rel2sql;
 
 import org.apache.calcite.adapter.jdbc.JdbcTable;
-import org.apache.calcite.linq4j.Ord;
 import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.plan.RelOptSamplingParameters;
 import org.apache.calcite.plan.RelOptTable;
@@ -90,6 +89,7 @@ import org.apache.calcite.sql.fun.SqlSingleValueAggFunction;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.util.SqlShuttle;
+import org.apache.calcite.sql.validate.SqlNameMatchers;
 import org.apache.calcite.sql.validate.SqlValidatorUtil;
 import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.calcite.util.Pair;
@@ -112,7 +112,6 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Deque;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -245,7 +244,7 @@ public class RelToSqlConverter extends SqlImplementor
     // preventing ClickHouse scoping issues while avoiding redundant sub-query nesting.
     final SqlSelect innerSelect = input.asSelect();
     final SqlNodeList originalSelectList = innerSelect.getSelectList();
-    final List<String> fieldNames = inputRel.getRowType().getFieldNames();
+    final List<String> fieldNames = uniquifyFieldNames(inputRel.getRowType());
 
     final List<SqlNode> newSelectList = new ArrayList<>();
 
@@ -305,7 +304,9 @@ public class RelToSqlConverter extends SqlImplementor
 
     if (dialect.shouldWrapNestedJoin(e)) {
 
-      Set<String> usedNames = new HashSet<>(e.getRowType().getFieldNames());
+      Set<String> usedNames =
+          SqlNameMatchers.withCaseSensitive(dialect.isCaseSensitive()).createSet();
+      usedNames.addAll(uniquifyFieldNames(e.getRowType()));
       // Add both left and right aliases
       if (leftResult.neededAlias != null) {
         usedNames.add(leftResult.neededAlias);
@@ -573,8 +574,8 @@ public class RelToSqlConverter extends SqlImplementor
         final Context context = x.qualifiedContext();
         if (selectListRequired(context)) {
           final ImmutableList.Builder<SqlNode> selectList = ImmutableList.builder();
-          // Fieldnames are unique since they are created by SqlValidatorUtil.deriveJoinRowType()
-          final List<String> uniqueFieldNames = input.getRowType().getFieldNames();
+          final List<String> uniqueFieldNames =
+              uniquifyFieldNames(input.getRowType());
           for (int i = 0; i < context.fieldCount; i++) {
             final SqlNode field = context.field(i);
             final String fieldName = uniqueFieldNames.get(i);
@@ -590,8 +591,9 @@ public class RelToSqlConverter extends SqlImplementor
     }
   }
 
-  private static boolean selectListRequired(Context context) {
-    Set<String> uniqueFieldNames = new HashSet<>();
+  private boolean selectListRequired(Context context) {
+    Set<String> uniqueFieldNames =
+        SqlNameMatchers.withCaseSensitive(dialect.isCaseSensitive()).createSet();
     for (SqlNode node : context.fieldList()) {
       if (node instanceof SqlIdentifier) {
         SqlIdentifier field = (SqlIdentifier) node;
@@ -683,7 +685,9 @@ public class RelToSqlConverter extends SqlImplementor
     }
     parseCorrelTable(e, x);
     final Builder builder = x.builder(e);
+    final List<String> fieldNames = uniquifyFieldNames(e.getRowType());
     if (!isStar(e.getProjects(), e.getInput().getRowType(), e.getRowType())
+        || !fieldNames.equals(e.getRowType().getFieldNames())
         || !dialect.supportGenerateSelectStar(e.getInput())) {
       final List<SqlNode> selectList = new ArrayList<>();
       for (RexNode ref : e.getProjects()) {
@@ -693,7 +697,7 @@ public class RelToSqlConverter extends SqlImplementor
               e.getRowType().getFieldList().get(selectList.size());
           sqlExpr = castNullType(sqlExpr, field.getType());
         }
-        addSelect(selectList, sqlExpr, e.getRowType());
+        addSelect(selectList, sqlExpr, fieldNames);
       }
       // We generate "SELECT 1 FROM EMP" replace "SELECT FROM EMP"
       if (selectList.isEmpty()) {
@@ -740,13 +744,14 @@ public class RelToSqlConverter extends SqlImplementor
       rexOvers.addAll(builder.context.toSql(group, e.constants, inputFieldCount));
     }
     final List<SqlNode> selectList = new ArrayList<>();
+    final List<String> fieldNames = uniquifyFieldNames(e.getRowType());
 
     for (RelDataTypeField field : input.getRowType().getFieldList()) {
-      addSelect(selectList, builder.context.field(field.getIndex()), e.getRowType());
+      addSelect(selectList, builder.context.field(field.getIndex()), fieldNames);
     }
 
     for (SqlNode rexOver : rexOvers) {
-      addSelect(selectList, rexOver, e.getRowType());
+      addSelect(selectList, rexOver, fieldNames);
     }
 
     builder.setSelect(new SqlNodeList(selectList, POS));
@@ -789,9 +794,10 @@ public class RelToSqlConverter extends SqlImplementor
    */
   protected void buildAggGroupList(Aggregate e, Builder builder,
       List<SqlNode> groupByList, List<SqlNode> selectList) {
+    final List<String> fieldNames = uniquifyFieldNames(e.getRowType());
     for (int group : e.getGroupSet()) {
       final SqlNode field = builder.context.field(group);
-      addSelect(selectList, field, e.getRowType());
+      addSelect(selectList, field, fieldNames);
       groupByList.add(field);
     }
   }
@@ -807,6 +813,7 @@ public class RelToSqlConverter extends SqlImplementor
    */
   protected Builder buildAggregate(Aggregate e, Builder builder,
       List<SqlNode> selectList, List<SqlNode> groupByList) {
+    final List<String> fieldNames = uniquifyFieldNames(e.getRowType());
     for (AggregateCall aggCall : e.getAggCallList()) {
       SqlNode aggCallSqlNode = builder.context.toSql(aggCall);
       RelDataType aggCallRelDataType = aggCall.getType();
@@ -815,7 +822,7 @@ public class RelToSqlConverter extends SqlImplementor
       } else if (aggCall.getAggregation() instanceof SqlMinMaxAggFunction) {
         aggCallSqlNode = dialect.rewriteMaxMinExpr(aggCallSqlNode, aggCallRelDataType);
       }
-      addSelect(selectList, aggCallSqlNode, e.getRowType());
+      addSelect(selectList, aggCallSqlNode, fieldNames);
     }
     builder.setSelect(new SqlNodeList(selectList, POS));
     if (!groupByList.isEmpty() || e.getAggCallList().isEmpty()) {
@@ -858,13 +865,14 @@ public class RelToSqlConverter extends SqlImplementor
         + aggregate.getGroupSet() + ", just possibly a different order";
 
     final List<SqlNode> groupKeys = new ArrayList<>();
+    final List<String> fieldNames = uniquifyFieldNames(aggregate.getRowType());
     for (int key : groupList) {
       final SqlNode field = builder.context.field(key);
       groupKeys.add(field);
     }
     for (int key : sortedGroupList) {
       final SqlNode field = builder.context.field(key);
-      addSelect(selectList, field, aggregate.getRowType());
+      addSelect(selectList, field, fieldNames);
     }
     switch (aggregate.getGroupType()) {
     case SIMPLE:
@@ -990,9 +998,10 @@ public class RelToSqlConverter extends SqlImplementor
     final Builder builder = x.builder(e);
     if (!isStar(program)) {
       final List<SqlNode> selectList = new ArrayList<>(program.getProjectList().size());
+      final List<String> fieldNames = uniquifyFieldNames(e.getRowType());
       for (RexLocalRef ref : program.getProjectList()) {
         SqlNode sqlExpr = builder.context.toSql(program, ref);
-        addSelect(selectList, sqlExpr, e.getRowType());
+        addSelect(selectList, sqlExpr, fieldNames);
       }
       builder.setSelect(new SqlNodeList(selectList, POS));
     }
@@ -1012,7 +1021,7 @@ public class RelToSqlConverter extends SqlImplementor
     SqlNode query;
     final boolean rename = stack.size() <= 1
         || !(Iterables.get(stack, 1).r instanceof TableModify);
-    final List<String> fieldNames = e.getRowType().getFieldNames();
+    final List<String> fieldNames = uniquifyFieldNames(e.getRowType());
     if (!dialect.supportsAliasedValues() && rename) {
       // Some dialects (such as Oracle and BigQuery) don't support
       // "AS t (c1, c2)". So instead of
@@ -1229,8 +1238,9 @@ public class RelToSqlConverter extends SqlImplementor
       // Generates explicit column names instead of start(*) for
       // non-root order by to avoid ambiguity.
       final List<SqlNode> selectList = Expressions.list();
+      final List<String> fieldNames = uniquifyFieldNames(e.getRowType());
       for (RelDataTypeField field : e.getRowType().getFieldList()) {
-        addSelect(selectList, builder.context.field(field.getIndex()), e.getRowType());
+        addSelect(selectList, builder.context.field(field.getIndex()), fieldNames);
       }
       builder.select.setSelectList(new SqlNodeList(selectList, POS));
     }
@@ -1523,9 +1533,10 @@ public class RelToSqlConverter extends SqlImplementor
 
     final int fieldCount = e.getRowType().getFieldCount();
     final int inputSize = e.getInputs().size();
+    final List<String> fieldNames = uniquifyFieldNames(e.getRowType());
 
     for (int i = 0; i < fieldCount; i++) {
-      fieldNodes.add(new SqlIdentifier(e.getRowType().getFieldNames().get(i), POS));
+      fieldNodes.add(new SqlIdentifier(fieldNames.get(i), POS));
     }
 
     for (int i = 0; i < inputSize; i++) {
@@ -1567,23 +1578,16 @@ public class RelToSqlConverter extends SqlImplementor
     final List<SqlNode> result = new ArrayList<>();
     result.add(leftOperand);
     result.add(new SqlIdentifier(alias, POS));
-    Ord.forEach(rowType.getFieldNames(), (fieldName, i) -> {
-      if (SqlUtil.isGeneratedAlias(fieldName)) {
-        fieldName = "col_" + i;
-      }
-      result.add(new SqlIdentifier(fieldName, POS));
-    });
-    return result;
-  }
-
-  @Override public void addSelect(List<SqlNode> selectList, SqlNode node,
-      RelDataType rowType) {
-    String name = rowType.getFieldNames().get(selectList.size());
-    @Nullable String alias = SqlValidatorUtil.alias(node);
-    if (alias == null || !alias.equals(name)) {
-      node = as(node, name);
+    final List<String> names = new ArrayList<>(rowType.getFieldCount());
+    for (int i = 0; i < rowType.getFieldCount(); i++) {
+      final String fieldName = rowType.getFieldNames().get(i);
+      names.add(SqlUtil.isGeneratedAlias(fieldName)
+          ? "col_" + i
+          : fieldName);
     }
-    selectList.add(node);
+    SqlValidatorUtil.uniquify(names, dialect.isCaseSensitive())
+        .forEach(fieldName -> result.add(new SqlIdentifier(fieldName, POS)));
+    return result;
   }
 
   private void parseCorrelTable(RelNode relNode, Result x) {

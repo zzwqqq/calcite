@@ -9600,6 +9600,45 @@ class RelToSqlConverterTest {
       };
 
   /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7642">[CALCITE-7642]
+   * RelToSqlConverter may generate duplicate output column names
+   * for case-insensitive dialects</a>. */
+  @Test void testCaseInsensitiveAliases() {
+    final SqlDialect dialect =
+        new PostgresqlSqlDialect(
+            PostgresqlSqlDialect.DEFAULT_CONTEXT.withCaseSensitive(false));
+    final String expected = "SELECT \"t\".\"id\", \"t0\".\"ID\" AS \"ID0\"\n"
+        + "FROM (VALUES (1)) AS \"t\" (\"id\"),\n"
+        + "(VALUES (1)) AS \"t0\" (\"ID\")";
+    relFn(b -> {
+      b.values(new String[]{"id"}, 1);
+      b.values(new String[]{"ID"}, 1);
+      return b.join(JoinRelType.INNER).build();
+    }).dialect(dialect).ok(expected);
+    relFn(b -> {
+      b.values(new String[]{"id"}, 1);
+      b.values(new String[]{"ID"}, 1);
+      return b.join(JoinRelType.INNER)
+          .project(b.fields(), ImmutableList.of(), true)
+          .build();
+    }).dialect(dialect).ok(expected);
+    relFn(b -> {
+      b.values(new String[]{"id"}, 1);
+      b.values(new String[]{"ID"}, 1);
+      return b.join(JoinRelType.INNER)
+          .filter(b.equals(b.field(0), b.literal(1)))
+          .build();
+    }).dialect(dialect).ok("SELECT \"t\".\"id\" AS \"id\", \"t0\".\"ID\" AS \"ID0\"\n"
+        + "FROM (VALUES (1)) AS \"t\" (\"id\"),\n"
+        + "(VALUES (1)) AS \"t0\" (\"ID\")\n"
+        + "WHERE \"t\".\"id\" = 1");
+    relFn(b -> b.values(new String[]{"id", "ID"}, 1, 1).build())
+        .dialect(dialect)
+        .ok("SELECT *\n"
+            + "FROM (VALUES (1, 1)) AS \"t\" (\"id\", \"ID0\")");
+  }
+
+  /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-7483">[CALCITE-7483]
    * RelToSqlConverter generates SELECT * despite supportGenerateSelectStar</a>.
    * Bare TableScan. */
@@ -9732,7 +9771,7 @@ class RelToSqlConverterTest {
         + " \"EMP\".\"EMPNO\", \"EMP\".\"ENAME\", \"EMP\".\"JOB\","
         + " \"EMP\".\"MGR\", \"EMP\".\"HIREDATE\", \"EMP\".\"SAL\","
         + " \"EMP\".\"COMM\", \"EMP\".\"DEPTNO\","
-        + " \"DEPT\".\"DEPTNO\","
+        + " \"DEPT\".\"DEPTNO\" AS \"DEPTNO0\","
         + " \"DEPT\".\"DNAME\", \"DEPT\".\"LOC\"\n"
         + "FROM \"scott\".\"EMP\"\n"
         + "INNER JOIN \"scott\".\"DEPT\""

@@ -272,9 +272,19 @@ public abstract class SqlImplementor {
   public abstract Result visitInput(RelNode e, int i, boolean anon,
       boolean ignoreClauses, Set<Clause> expectedClauses);
 
+  protected List<String> uniquifyFieldNames(RelDataType rowType) {
+    return SqlValidatorUtil.uniquify(rowType.getFieldNames(),
+        dialect.isCaseSensitive());
+  }
+
   public void addSelect(List<SqlNode> selectList, SqlNode node,
       RelDataType rowType) {
-    String name = rowType.getFieldNames().get(selectList.size());
+    addSelect(selectList, node, uniquifyFieldNames(rowType));
+  }
+
+  protected void addSelect(List<SqlNode> selectList, SqlNode node,
+      List<String> fieldNames) {
+    String name = fieldNames.get(selectList.size());
     @Nullable String alias = SqlValidatorUtil.alias(node);
     if (alias == null || !alias.equals(name)) {
       node = as(node, name);
@@ -2040,8 +2050,10 @@ public abstract class SqlImplementor {
         }
         if (!dialect.supportGenerateSelectStar(rel.getInput(0))) {
           final List<SqlNode> expandedSelectList = new ArrayList<>();
+          final List<String> fieldNames =
+              uniquifyFieldNames(rel.getInput(0).getRowType());
           for (int i = 0; i < newContext.fieldCount; i++) {
-            expandedSelectList.add(newContext.field(i));
+            addSelect(expandedSelectList, newContext.field(i), fieldNames);
           }
           select.setSelectList(new SqlNodeList(expandedSelectList, POS));
         }
@@ -2403,8 +2415,10 @@ public abstract class SqlImplementor {
             !dialect.hasImplicitTableAlias() || aliases.size() > 1;
         final Context ctx = aliasContext(aliases, qualified);
         final List<SqlNode> expandedList = new ArrayList<>();
+        final List<String> fieldNames =
+            uniquifyFieldNames(expectedRel.getInput(0).getRowType());
         for (int i = 0; i < ctx.fieldCount; i++) {
-          expandedList.add(ctx.field(i));
+          addSelect(expandedList, ctx.field(i), fieldNames);
         }
         return new SqlSelect(select.getParserPosition(),
             (SqlNodeList) select.getOperandList().get(0),
