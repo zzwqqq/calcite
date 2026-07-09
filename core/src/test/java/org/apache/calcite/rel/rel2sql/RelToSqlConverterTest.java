@@ -9599,43 +9599,98 @@ class RelToSqlConverterTest {
         }
       };
 
-  /** Test case for
+  /** Test cases for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-7642">[CALCITE-7642]
-   * RelToSqlConverter may generate duplicate output column names
-   * for case-insensitive dialects</a>. */
-  @Test void testCaseInsensitiveAliases() {
-    final SqlDialect dialect =
+   * RelToSqlConverter may generate duplicate aliases for internal derived tables
+   * in case-insensitive dialects</a>. */
+  @Test void testCaseInsensitiveRootAliases() {
+    final SqlDialect mysqlDialect =
+        new MysqlSqlDialect(
+            MysqlSqlDialect.DEFAULT_CONTEXT.withCaseSensitive(false));
+    relFn(b -> b.values(new String[]{"id", "ID"}, 1, 2).build())
+        .dialect(mysqlDialect)
+        .ok("SELECT 1 AS `id`, 2 AS `ID`");
+  }
+
+  @Test void testCaseInsensitiveDerivedValuesAliases() {
+    final SqlDialect postgresqlDialect =
         new PostgresqlSqlDialect(
             PostgresqlSqlDialect.DEFAULT_CONTEXT.withCaseSensitive(false));
-    final String expected = "SELECT \"t\".\"id\", \"t0\".\"ID\" AS \"ID0\"\n"
-        + "FROM (VALUES (1)) AS \"t\" (\"id\"),\n"
-        + "(VALUES (1)) AS \"t0\" (\"ID\")";
+    relFn(b -> b.values(new String[]{"id", "ID"}, 1, 2)
+        .filter(b.equals(b.field(1), b.literal(2)))
+        .build())
+        .dialect(postgresqlDialect)
+        .ok("SELECT \"id\", \"ID0\" AS \"ID\"\n"
+            + "FROM (VALUES (1, 2)) AS \"t\" (\"id\", \"ID0\")\n"
+            + "WHERE \"ID0\" = 2");
+  }
+
+  @Test void testCaseInsensitiveJoinAliases() {
+    final SqlDialect mysqlDialect =
+        new MysqlSqlDialect(
+            MysqlSqlDialect.DEFAULT_CONTEXT.withCaseSensitive(false));
     relFn(b -> {
       b.values(new String[]{"id"}, 1);
-      b.values(new String[]{"ID"}, 1);
-      return b.join(JoinRelType.INNER).build();
-    }).dialect(dialect).ok(expected);
-    relFn(b -> {
-      b.values(new String[]{"id"}, 1);
-      b.values(new String[]{"ID"}, 1);
-      return b.join(JoinRelType.INNER)
+      b.values(new String[]{"ID"}, 2);
+      final RelNode left = b.join(JoinRelType.INNER)
           .project(b.fields(), ImmutableList.of(), true)
           .build();
-    }).dialect(dialect).ok(expected);
-    relFn(b -> {
-      b.values(new String[]{"id"}, 1);
-      b.values(new String[]{"ID"}, 1);
-      return b.join(JoinRelType.INNER)
-          .filter(b.equals(b.field(0), b.literal(1)))
+      return b.push(left)
+          .values(new String[]{"x"}, 3)
+          .join(JoinRelType.INNER)
+          .project(ImmutableList.of(b.field(0), b.field(1)),
+              ImmutableList.of(), true)
           .build();
-    }).dialect(dialect).ok("SELECT \"t\".\"id\" AS \"id\", \"t0\".\"ID\" AS \"ID0\"\n"
-        + "FROM (VALUES (1)) AS \"t\" (\"id\"),\n"
-        + "(VALUES (1)) AS \"t0\" (\"ID\")\n"
-        + "WHERE \"t\".\"id\" = 1");
-    relFn(b -> b.values(new String[]{"id", "ID"}, 1, 1).build())
-        .dialect(dialect)
-        .ok("SELECT *\n"
-            + "FROM (VALUES (1, 1)) AS \"t\" (\"id\", \"ID0\")");
+    }).dialect(mysqlDialect).ok("SELECT `t1`.`id`, `t1`.`ID0` AS `ID`\n"
+        + "FROM (SELECT `t`.`id`, `t0`.`ID` AS `ID0`\n"
+        + "FROM (SELECT 1 AS `id`) AS `t`,\n"
+        + "(SELECT 2 AS `ID`) AS `t0`) AS `t1`,\n"
+        + "(SELECT 3 AS `x`) AS `t2`");
+  }
+
+  @Test void testCaseInsensitiveCorrelateAliases() {
+    final SqlDialect postgresqlDialect =
+        new PostgresqlSqlDialect(
+            PostgresqlSqlDialect.DEFAULT_CONTEXT.withCaseSensitive(false));
+    relFn(b -> {
+      final Holder<RexCorrelVariable> v = Holder.empty();
+      return b.values(new String[]{"id", "ID"}, 1, 2)
+          .variable(v::set)
+          .values(new String[]{"x"}, 2)
+          .filter(b.equals(b.field("x"),
+              b.getRexBuilder().makeFieldAccess(v.get(), 1)))
+          .correlate(JoinRelType.INNER, v.get().id, b.field(2, 0, 1))
+          .build();
+    }).dialect(postgresqlDialect).ok("SELECT *\n"
+        + "FROM (VALUES (1, 2)) AS \"$cor0\" (\"id\", \"ID0\"),\n"
+        + "LATERAL (SELECT *\n"
+        + "FROM (VALUES (2)) AS \"t0\" (\"x\")\n"
+        + "WHERE \"x\" = \"$cor0\".\"ID0\") AS \"t1\"");
+  }
+
+  @Test void testCaseInsensitiveCorrelatedProjectAliases() {
+    final SqlDialect postgresqlDialect =
+        new PostgresqlSqlDialect(
+            PostgresqlSqlDialect.DEFAULT_CONTEXT.withCaseSensitive(false));
+    relFn(b -> {
+      final Holder<RexCorrelVariable> v = Holder.empty();
+      return b.values(new String[]{"id", "ID"}, 1, 2)
+          .variable(v::set)
+          .project(
+              ImmutableList.of(
+                  b.field(0),
+                  b.scalarQuery(unused ->
+                      b.values(new String[]{"x"}, 2)
+                          .filter(b.equals(b.field("x"),
+                              b.getRexBuilder().makeFieldAccess(v.get(), 1)))
+                          .project(b.field("x"))
+                          .build())),
+              ImmutableList.of(), false, ImmutableList.of(v.get().id))
+          .build();
+    }).dialect(postgresqlDialect).ok("SELECT \"id\", (SELECT *\n"
+        + "FROM (VALUES (2)) AS \"t0\" (\"x\")\n"
+        + "WHERE \"x\" = \"t\".\"ID0\") AS \"$f1\"\n"
+        + "FROM (VALUES (1, 2)) AS \"t\" (\"id\", \"ID0\")");
   }
 
   /** Test case for
@@ -9771,7 +9826,7 @@ class RelToSqlConverterTest {
         + " \"EMP\".\"EMPNO\", \"EMP\".\"ENAME\", \"EMP\".\"JOB\","
         + " \"EMP\".\"MGR\", \"EMP\".\"HIREDATE\", \"EMP\".\"SAL\","
         + " \"EMP\".\"COMM\", \"EMP\".\"DEPTNO\","
-        + " \"DEPT\".\"DEPTNO\" AS \"DEPTNO0\","
+        + " \"DEPT\".\"DEPTNO\","
         + " \"DEPT\".\"DNAME\", \"DEPT\".\"LOC\"\n"
         + "FROM \"scott\".\"EMP\"\n"
         + "INNER JOIN \"scott\".\"DEPT\""

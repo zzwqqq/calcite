@@ -40,7 +40,9 @@ import org.apache.calcite.rel.rules.FullToLeftAndRightJoinRule;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeField;
+import org.apache.calcite.rel.type.RelDataTypeFieldImpl;
 import org.apache.calcite.rel.type.RelDataTypeSystemImpl;
+import org.apache.calcite.rel.type.RelRecordType;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexCorrelVariable;
@@ -272,24 +274,36 @@ public abstract class SqlImplementor {
   public abstract Result visitInput(RelNode e, int i, boolean anon,
       boolean ignoreClauses, Set<Clause> expectedClauses);
 
-  protected List<String> uniquifyFieldNames(RelDataType rowType) {
-    return SqlValidatorUtil.uniquify(rowType.getFieldNames(),
-        dialect.isCaseSensitive());
-  }
-
   public void addSelect(List<SqlNode> selectList, SqlNode node,
       RelDataType rowType) {
-    addSelect(selectList, node, uniquifyFieldNames(rowType));
+    String name = rowType.getFieldNames().get(selectList.size());
+    addSelect(selectList, node, name);
   }
 
-  protected void addSelect(List<SqlNode> selectList, SqlNode node,
-      List<String> fieldNames) {
-    String name = fieldNames.get(selectList.size());
+  private void addSelect(List<SqlNode> selectList, SqlNode node,
+      String name) {
     @Nullable String alias = SqlValidatorUtil.alias(node);
     if (alias == null || !alias.equals(name)) {
       node = as(node, name);
     }
     selectList.add(node);
+  }
+
+  /** Returns field names to use when a result is wrapped as a derived table. */
+  protected List<String> derivedTableFieldNames(RelDataType rowType) {
+    return rowType.getFieldNames();
+  }
+
+  /** Returns a copy of a row type with different field names. */
+  private static RelDataType renameRowTypeFields(RelDataType rowType,
+      List<String> fieldNames) {
+    final List<RelDataTypeField> fields = new ArrayList<>();
+    final List<RelDataTypeField> oldFields = rowType.getFieldList();
+    for (int i = 0; i < oldFields.size(); i++) {
+      fields.add(new RelDataTypeFieldImpl(fieldNames.get(i), i,
+          oldFields.get(i).getType()));
+    }
+    return new RelRecordType(rowType.getStructKind(), fields, rowType.isNullable());
   }
 
   /** Convenience method for creating column and table aliases.
@@ -2016,13 +2030,17 @@ public abstract class SqlImplementor {
       final Set<Clause> clauses2 = ignoreClauses ? ImmutableSet.of() : clauses;
       final boolean needNew = needNewSubQuery(rel, this.clauses, clauses2);
       assert needNew == this.needNew;
+      final boolean needFieldRename = neededType != null
+          && node.getKind() != SqlKind.SELECT
+          && !derivedTableFieldNames(neededType).equals(neededType.getFieldNames());
+      final Result input = needNew || needFieldRename ? forDerivedTable() : this;
       SqlSelect select;
       Expressions.FluentList<Clause> clauseList = Expressions.list();
       if (needNew) {
-        select = subSelect();
+        select = input.subSelect();
       } else {
-        select = asSelect();
-        clauseList.addAll(this.clauses);
+        select = input.asSelect();
+        clauseList.addAll(input.clauses);
       }
       clauseList.appendAll(clauses);
       final Context newContext;
@@ -2034,32 +2052,56 @@ public abstract class SqlImplementor {
         newContext = selectListContext(selectList, aliasRef);
       } else {
         boolean qualified =
-            !dialect.hasImplicitTableAlias() || aliases.size() > 1;
+            !dialect.hasImplicitTableAlias() || input.aliases.size() > 1;
         // basically, we did a subSelect() since needNew is set and neededAlias is not null
         // now, we need to make sure that we need to update the alias context.
         // if our aliases map has a single element:  <neededAlias, rowType>,
         // then we don't need to rewrite the alias but otherwise, it should be updated.
         if (needNew
             && neededAlias != null
-            && (aliases.size() != 1 || !aliases.containsKey(neededAlias))) {
+            && (input.aliases.size() != 1 || !input.aliases.containsKey(neededAlias))) {
           newAliases =
               ImmutableMap.of(neededAlias, rel.getInput(0).getRowType());
           newContext = aliasContext(newAliases, qualified);
         } else {
-          newContext = aliasContext(aliases, qualified);
+          newContext = aliasContext(input.aliases, qualified);
         }
         if (!dialect.supportGenerateSelectStar(rel.getInput(0))) {
           final List<SqlNode> expandedSelectList = new ArrayList<>();
-          final List<String> fieldNames =
-              uniquifyFieldNames(rel.getInput(0).getRowType());
           for (int i = 0; i < newContext.fieldCount; i++) {
-            addSelect(expandedSelectList, newContext.field(i), fieldNames);
+            expandedSelectList.add(newContext.field(i));
           }
           select.setSelectList(new SqlNodeList(expandedSelectList, POS));
         }
       }
+      if ((needNew || needFieldRename) && input != this) {
+        restoreOutputFieldNames(rel, select, newContext);
+      }
       return new Builder(rel, clauseList, select, newContext, isAnon(),
-          needNew && !aliases.containsKey(neededAlias) ? newAliases : aliases);
+          needNew && !input.aliases.containsKey(neededAlias) ? newAliases : input.aliases);
+    }
+
+    /** Restores field names after an input was renamed for a derived table. */
+    private void restoreOutputFieldNames(RelNode rel, SqlSelect select,
+        Context context) {
+      final RelDataType rowType = rel.getRowType();
+      if (!select.getSelectList().equals(SqlNodeList.SINGLETON_STAR)
+          || context.fieldCount != rowType.getFieldCount()) {
+        return;
+      }
+      final List<String> fieldNames = rowType.getFieldNames();
+      // Project internal aliases back to the row type field names.
+      for (int i = 0; i < context.fieldCount; i++) {
+        final @Nullable String name = SqlValidatorUtil.alias(context.field(i));
+        if (name == null || !name.equals(fieldNames.get(i))) {
+          final List<SqlNode> selectList = new ArrayList<>();
+          for (int j = 0; j < context.fieldCount; j++) {
+            addSelect(selectList, context.field(j), rowType);
+          }
+          select.setSelectList(new SqlNodeList(selectList, POS));
+          return;
+        }
+      }
     }
 
     /** Returns whether a new sub-query is required. */
@@ -2415,10 +2457,8 @@ public abstract class SqlImplementor {
             !dialect.hasImplicitTableAlias() || aliases.size() > 1;
         final Context ctx = aliasContext(aliases, qualified);
         final List<SqlNode> expandedList = new ArrayList<>();
-        final List<String> fieldNames =
-            uniquifyFieldNames(expectedRel.getInput(0).getRowType());
         for (int i = 0; i < ctx.fieldCount; i++) {
-          addSelect(expandedList, ctx.field(i), fieldNames);
+          expandedList.add(ctx.field(i));
         }
         return new SqlSelect(select.getParserPosition(),
             (SqlNodeList) select.getOperandList().get(0),
@@ -2458,18 +2498,89 @@ public abstract class SqlImplementor {
       return aliasContext(aliases, true);
     }
 
+    /** Returns a result that uses derived-table field names. */
+    private Result forDerivedTable() {
+      if (neededType == null) {
+        return this;
+      }
+      // Internal derived table aliases may need dialect-specific uniqueness.
+      final List<String> fieldNames = derivedTableFieldNames(neededType);
+      if (fieldNames.equals(neededType.getFieldNames())) {
+        return this;
+      }
+      final RelDataType type = renameRowTypeFields(neededType, fieldNames);
+      final SqlNode newNode = withDerivedTableFieldNames(fieldNames);
+      final ImmutableMap.Builder<String, RelDataType> aliasBuilder =
+          ImmutableMap.builder();
+      for (Map.Entry<String, RelDataType> alias : aliases.entrySet()) {
+        aliasBuilder.put(alias.getKey(),
+            alias.getValue() == neededType ? type : alias.getValue());
+      }
+      return new Result(newNode, clauses, neededAlias, type, aliasBuilder.build(), anon,
+          ignoreClauses, expectedClauses, expectedRel, forceExplicitAlias);
+    }
+
+    /** Rewrites a result for use in a derived table. */
+    private SqlNode withDerivedTableFieldNames(List<String> fieldNames) {
+      if (node.getKind() == SqlKind.AS) {
+        final SqlCall call = (SqlCall) node;
+        final List<SqlNode> operands = call.getOperandList();
+        final int fieldAliasStart = 2;
+        if (operands.size() == fieldNames.size() + fieldAliasStart) {
+          final List<SqlNode> newOperands = new ArrayList<>(operands.size());
+          newOperands.add(call.operand(0));
+          newOperands.add(call.operand(1));
+          for (String fieldName : fieldNames) {
+            newOperands.add(new SqlIdentifier(fieldName, POS));
+          }
+          return SqlStdOperatorTable.AS.createCall(POS, newOperands);
+        }
+      }
+      return withSelectFieldNames(fieldNames);
+    }
+
+    /** Rewrites a SELECT list to expose the given field names. */
+    private SqlNode withSelectFieldNames(List<String> fieldNames) {
+      final SqlSelect select = asSelect();
+      final SqlNodeList selectList = select.getSelectList();
+      final List<SqlNode> newSelectList = new ArrayList<>();
+      final Context context =
+          aliasContext(aliases, !dialect.hasImplicitTableAlias() || aliases.size() > 1);
+      if (selectList.equals(SqlNodeList.SINGLETON_STAR)) {
+        for (int i = 0; i < fieldNames.size(); i++) {
+          addSelect(newSelectList, context.field(i), fieldNames.get(i));
+        }
+      } else {
+        for (int i = 0; i < fieldNames.size(); i++) {
+          SqlNode selectItem = selectList.get(i);
+          if (selectItem.getKind() == SqlKind.AS) {
+            selectItem = ((SqlCall) selectItem).operand(0);
+          }
+          if (selectItem instanceof SqlIdentifier
+              && ((SqlIdentifier) selectItem).isSimple()
+              && aliases.size() > 1) {
+            selectItem = context.field(i);
+          }
+          addSelect(newSelectList, selectItem, fieldNames.get(i));
+        }
+      }
+      select.setSelectList(new SqlNodeList(newSelectList, POS));
+      return select;
+    }
+
     /**
      * In join, when the left and right nodes have been generated,
      * update their alias with 'neededAlias' if not null.
      */
     public Result resetAlias() {
-      if (neededAlias == null) {
-        return this;
-      } else {
-        return new Result(node, clauses, neededAlias, neededType,
-            ImmutableMap.of(neededAlias, castNonNull(neededType)), anon, ignoreClauses,
-            expectedClauses, expectedRel, false);
+      final Result input = forDerivedTable();
+      if (input.neededAlias == null) {
+        return input;
       }
+      return new Result(input.node, input.clauses, input.neededAlias, input.neededType,
+          ImmutableMap.of(input.neededAlias, castNonNull(input.neededType)), input.anon,
+          input.ignoreClauses, input.expectedClauses, input.expectedRel,
+          input.forceExplicitAlias);
     }
 
     /**
@@ -2479,9 +2590,12 @@ public abstract class SqlImplementor {
      * @param type type of the node associated with the alias
      */
     public Result resetAlias(String alias, RelDataType type) {
-      return new Result(node, clauses, alias, neededType,
-          ImmutableMap.of(alias, type), anon, ignoreClauses,
-          expectedClauses, expectedRel, false);
+      final Result input = forDerivedTable();
+      final RelDataType aliasType =
+          input.neededType != null && neededType == type ? input.neededType : type;
+      return new Result(input.node, input.clauses, alias, input.neededType,
+          ImmutableMap.of(alias, aliasType), input.anon, input.ignoreClauses,
+          input.expectedClauses, input.expectedRel, input.forceExplicitAlias);
     }
 
     /**
@@ -2493,17 +2607,20 @@ public abstract class SqlImplementor {
      * @return New Result with forced explicit alias
      */
     public Result resetAliasForCorrelation(String alias, RelDataType type) {
+      final Result input = forDerivedTable();
+      final RelDataType aliasType =
+          input.neededType != null && neededType == type ? input.neededType : type;
       return new Result(
-          node,
-          clauses,
+          input.node,
+          input.clauses,
           alias,
-          neededType,
-          ImmutableMap.of(alias, type),
-          anon,
-          ignoreClauses,
-          expectedClauses,
-          expectedRel,
-          true); // Force explicit alias
+          input.neededType,
+          ImmutableMap.of(alias, aliasType),
+          input.anon,
+          input.ignoreClauses,
+          input.expectedClauses,
+          input.expectedRel,
+          true);
     }
 
     /** Returns a copy of this Result, overriding the value of {@code anon}. */
